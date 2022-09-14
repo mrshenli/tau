@@ -1,18 +1,26 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import torch
-
 from torch.distributed.distributed_c10d import (
     get_global_rank,
     get_world_size,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.common_utils import run_tests
+from torch.utils._pytree import tree_map
+
+import spmd
 from spmd.testing.common_utils import (  # type: ignore
     DistTensorTestBase,
     with_comms,
 )
-from spmd.tensor import DeviceMesh
+from spmd.tensor import (
+    DTensor,
+    DeviceMesh,
+    Replicate,
+)
+from spmd.tensor.dispatch import operator_dispatch
 
+from functools import partial
 from typing import List
 
 
@@ -170,6 +178,74 @@ class TraceDeviceMesh2DTest(DistTensorTestBase, TraceDeviceMeshTestBase):
     @with_comms
     def test_all_gather_nd(self):
         self._test_all_gather_nd(torch.arange(4).reshape(2, 2))
+
+
+class TraceDistTensorTest(DistTensorTestBase):
+
+    @property
+    def world_size(self):
+        return 2
+
+    @with_comms
+    def test_expand_replicated(self):
+
+        def f(x, y):
+            return x + y
+
+        x = torch.ones(10, 10)
+        y = torch.ones(10, 10)
+        traced_f = make_fx(f)(x, y)
+
+        if self.rank == 0:
+            traced_f.graph.print_tabular()
+
+        node_to_obj = {}
+
+        def name_to_input(name):
+            mesh = DeviceMesh(self.device_type, torch.arange(2))
+            spec = [Replicate()]
+            return DTensor(x, mesh, spec) if "x" in name else DTensor(y, mesh, spec)
+
+        dispatch = partial(operator_dispatch, op_to_rules=DTensor._op_to_rules, custom_dispatch_ops=DTensor._custom_dispatch_ops)
+
+        for node in traced_f.graph.nodes:
+            if node.op == "placeholder":
+                node_to_obj[node] = name_to_input(node.name)
+            elif isinstance(node.target, torch._ops.OpOverload):
+                args = tree_map(lambda n: node_to_obj[n], node.args)
+                kwargs = tree_map(lambda n: node_to_obj[n], node.kwargs)
+                traced_dispatch = make_fx(dispatch)(
+                    node.target,
+                    args,
+                    kwargs,
+                    #DTensor._op_to_rules,
+                    #DTensor._custom_dispatch_ops,
+                )
+                #traced_dispatch.graph.eliminate_dead_code()
+                #traced_dispatch.graph.lint()
+                if self.rank == 0:
+                    traced_dispatch.graph.print_tabular()
+                """
+                with traced_f.graph.inserting_after(node):
+                    value_remap = {}
+
+                    for dt_node in traced_dispatch.graph.nodes:
+                        if dt_node.op == "placeholder":
+                            continue
+                        traced_f.graph.node_copy()
+                """
+                out = operator_dispatch(
+                    node.target,
+                    args,
+                    kwargs,
+                    DTensor._op_to_rules,
+                    DTensor._custom_dispatch_ops,
+                )
+                node_to_obj[node] = out
+            elif node.op == "output":
+                node_to_obj[node] = node.args[0]
+            else:
+                raise ValueError(f"Unrecognized node {node}")
 
 
 if __name__ == "__main__":
