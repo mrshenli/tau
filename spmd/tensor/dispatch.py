@@ -222,7 +222,7 @@ def operator_dispatch(
             return tuple(out_dts) if len(out_dts) > 1 else out_dts[0]
         else:
             if not any(
-                [_get_tracer(r) for r in tree_flatten(local_results)[0]]
+                [_get_tracer(r) for r in tree_flatten(local_results)[0] if isinstance(r, torch.Tensor)]
             ):
                 # eager mode
                 return wrap(local_results, output_sharding.output_spec)

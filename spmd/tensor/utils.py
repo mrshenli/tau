@@ -65,7 +65,7 @@ def pack_args_kwargs_with_local_tensor(
     args_schema: ArgKwargsType,
     redistribute_with_schema: bool = False,
 ) -> ArgKwargsType:
-    tracers = [_get_tracer(r) for r in tree_flatten(args)[0]]
+    tracers = [_get_tracer(r) for r in tree_flatten(args)[0] if isinstance(r, torch.Tensor)]
 
     flatten_args, args_tree_spec = tree_flatten(args)
     flatten_args_schema, _ = tree_flatten(args_schema)

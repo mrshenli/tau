@@ -4,8 +4,14 @@ from torch.distributed.distributed_c10d import (
     get_global_rank,
     get_world_size,
 )
-from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.proxy_tensor import (
+    get_proxy_slots,
+    make_fx,
+    proxy_slot,
+)
 from torch.testing._internal.common_utils import run_tests
+from torch.distributed._spmd.comm_tensor import _get_tracer
+
 from torch.utils._pytree import tree_flatten, tree_map
 
 import spmd
@@ -21,6 +27,7 @@ from spmd.tensor import (
 )
 from spmd.tensor.dispatch import operator_dispatch
 
+import copy
 from functools import partial
 from typing import List
 
@@ -187,11 +194,16 @@ class TraceDistTensorTest(DistTensorTestBase):
         # trace local graph
         x = xd.redistribute(
             device_mesh=mesh, placements=[Replicate()]
-        )._local_tensor
+        )._local_tensor.clone()
         y = yd.redistribute(
             device_mesh=mesh, placements=[Replicate()]
-        )._local_tensor
+        )._local_tensor.clone()
+        x.requires_grad = xd.requires_grad
+        y.requires_grad = yd.requires_grad
         traced_f = make_fx(f)(x, y)
+
+        if self.rank == 0:
+            traced_f.graph.print_tabular()
 
         # map intermediate tensors in traced graph to DTensor objects
         node_to_obj = {}
@@ -200,14 +212,17 @@ class TraceDistTensorTest(DistTensorTestBase):
         def name_to_input(name):
             return xd if "x" in name else yd
 
-        # avoid tracing _op_to_rules and _custom_dispatch_ops as placeholders
-        dispatch = partial(
-            operator_dispatch,
-            op_to_rules=DTensor._op_to_rules,
-            custom_dispatch_ops=DTensor._custom_dispatch_ops,
-        )
-
         replacements = {}
+
+        def remap_arg(arg):
+            if isinstance(arg, torch.fx.Node):
+                obj = node_to_obj[arg]
+                if _get_tracer(obj):
+                    print("==== got existing tracer")
+                    del obj.__dict__[proxy_slot]
+                return obj
+            else:
+                return arg
 
         # walk through the traced local graph and expand node with DTensor's
         # dispatch implementation
@@ -215,8 +230,9 @@ class TraceDistTensorTest(DistTensorTestBase):
             if node.op == "placeholder":
                 node_to_obj[node] = name_to_input(node.name)
             elif isinstance(node.target, torch._ops.OpOverload):
-                args = tree_map(lambda n: node_to_obj[n], node.args)
-                kwargs = tree_map(lambda n: node_to_obj[n], node.kwargs)
+                args = tree_map(remap_arg, node.args)
+                #kwargs = tree_map(lambda n: node_to_obj[n], node.kwargs)
+                kwargs = node.kwargs
 
                 out = operator_dispatch(
                     node.target,
@@ -227,11 +243,19 @@ class TraceDistTensorTest(DistTensorTestBase):
                 )
                 node_to_obj[node] = out
 
-                # avoid tracing node.target as a placeholder
-                dispatch_f = partial(dispatch, node.target)
+                # avoid tracing node.target, _op_to_rules and
+                # _custom_dispatch_ops as placeholders
+                dispatch = partial(
+                    operator_dispatch,
+                    node.target,
+                    # HACK
+                    kwargs=kwargs,
+                    op_to_rules=DTensor._op_to_rules,
+                    custom_dispatch_ops=DTensor._custom_dispatch_ops,
+                )
+                #dispatch_f = partial(dispatch, node.target)
                 # trace DTensor's dispatch logic
-                traced_dispatch = make_fx(dispatch_f)(args, kwargs)
-                replacements[node] = traced_dispatch
+                replacements[node] = make_fx(dispatch)(args)
             elif node.op == "output":
                 # do nothing, its args will be replaced by dispatcher's
                 # output in the next for loop
@@ -244,10 +268,16 @@ class TraceDistTensorTest(DistTensorTestBase):
             if node not in replacements:
                 continue
 
+            traced_dispatch = replacements[node]
             # Map DT's dispatch graph input placeholder nodes to the ones in
             # local traced graph. It uses index-based accessing, which is
             # brittle, just for testing purpose.
             flatten_args, _ = tree_flatten(node.args)
+            if self.rank == 0:
+                print("===== node ", node.op, node.target, node.args, node.kwargs)
+                #traced_dispatch.graph.lint()
+                #traced_dispatch.graph.eliminate_dead_code()
+                traced_dispatch.graph.print_tabular()
             i = 0
             value_remap = {}
             for dtn in traced_dispatch.graph.nodes:
@@ -281,6 +311,8 @@ class TraceDistTensorTest(DistTensorTestBase):
             device_mesh=mesh, placements=[Replicate()]
         ).to_local()
 
+        if self.rank == 0:
+            print(z, f(x, y))
         self.assertEqual(z, f(x, y))
 
     @with_comms
@@ -295,7 +327,7 @@ class TraceDistTensorTest(DistTensorTestBase):
         self._test_expand(xd, yd, f, mesh, out_spec)
 
     @with_comms
-    def test_simple_expand_shard_tensor(self):
+    def test_simple_expand_shard_replicate_tensor(self):
         def f(x, y):
             return x.matmul(y)
 
@@ -303,6 +335,34 @@ class TraceDistTensorTest(DistTensorTestBase):
 
         xd = DTensor.from_local(torch.ones(10, 10), mesh, [Shard(0)])
         yd = DTensor.from_local(torch.ones(10, 10), mesh, [Replicate()])
+        out_spec = [Shard(0)]
+        self._test_expand(xd, yd, f, mesh, out_spec)
+
+    @with_comms
+    def test_replicate_backward(self):
+        def f(x, y):
+            z = x + y
+            z.sum().backward()
+            return y.grad
+
+        mesh = DeviceMesh(self.device_type, torch.arange(2))
+
+        xd = DTensor.from_local(torch.ones(10, 10), mesh, [Replicate()])
+        yd = DTensor.from_local(torch.ones(10, 10, requires_grad=True), mesh, [Replicate()])
+        out_spec = [Replicate()]
+        self._test_expand(xd, yd, f, mesh, out_spec)
+
+    @with_comms
+    def test_simple_expand_replicate_shard_tensor(self):
+        def f(x, y):
+            z = x.matmul(y)
+            z.sum().backward()
+            return y.grad
+
+        mesh = DeviceMesh(self.device_type, torch.arange(2))
+
+        xd = DTensor.from_local(torch.ones(10, 10), mesh, [Shard(0)])
+        yd = DTensor.from_local(torch.ones(10, 10, requires_grad=True), mesh, [Replicate()])
         out_spec = [Shard(0)]
         self._test_expand(xd, yd, f, mesh, out_spec)
 
