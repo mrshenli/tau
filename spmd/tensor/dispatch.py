@@ -19,6 +19,8 @@ from spmd.tensor.utils import (
     pack_args_kwargs_with_local_tensor,
 )
 
+from torch.fx.experimental.proxy_tensor import get_torch_dispatch_modes, proxy_call
+
 
 """
 If _ENABLE_FALLBACK set to False, dispatch will fail when an op doesn't
