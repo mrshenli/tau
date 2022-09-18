@@ -67,13 +67,17 @@ def _decompose_reshard(val: List[_PlacementItem]) -> List[_PlacementItem]:
     return output
 
 
-def _redistributed_spmd_tensor_inner(
-    local_input: torch.Tensor,
-    sizes: torch.Size,
+def redistribute_spmd_tensor(
+    input: "spmd_tensor.DTensor",
     device_mesh: DeviceMesh,
-    current_placements: List[Placement],
-    target_placements: List[Placement],
-) -> torch.Tensor:
+    placements: List[Placement],
+) -> "spmd_tensor.DTensor":
+    current_placements = input.placements
+    local_tensor = input.to_local()
+    if input.device_mesh != device_mesh:
+        # TODO: alltoall reshuffling to change device_mesh if they are not the same
+        raise NotImplementedError("Cross device mesh comm not supported yet!")
+
     new_local_tensor = None
 
     sorted_placements = list(enumerate(zip(current_placements, placements)))
@@ -113,8 +117,8 @@ def _redistributed_spmd_tensor_inner(
             shard_dim = target.dim  # type: ignore
             num_chunks = device_mesh.size(dim=i)
             assert (
-                sizes[shard_dim] % num_chunks == 0
-            ), f"Only support chunk sharding evenly now. (When sharding tensor of size {sizes} on dim={shard_dim} into {num_chunks} shards.)"
+                input.size(shard_dim) % num_chunks == 0
+            ), f"Only support chunk sharding evenly now. (When sharding tensor of shape {input.shape} on dim={shard_dim} into {num_chunks} shards.)"
 
             chunk_size = (
                 local_tensor.size(shard_dim) // num_chunks
@@ -130,7 +134,7 @@ def _redistributed_spmd_tensor_inner(
                 new_local_tensor = torch.empty(
                     new_tensor_size,
                     device=local_tensor.device,
-                    dtype=local_tensor.dtype,
+                    dtype=input.dtype,
                 )
                 new_local_tensor = device_mesh.reduce_scatter_base(
                     new_local_tensor, local_tensor, mesh_dim=i
@@ -161,26 +165,6 @@ def _redistributed_spmd_tensor_inner(
         local_tensor = new_local_tensor
 
     assert new_local_tensor is not None, "redistribute failed!"
-
-    return new_local_tensor
-
-
-def redistribute_spmd_tensor(
-    input: "spmd_tensor.DTensor",
-    device_mesh: DeviceMesh,
-    placements: List[Placement],
-) -> "spmd_tensor.DTensor":
-    if input.device_mesh != device_mesh:
-        # TODO: alltoall reshuffling to change device_mesh if they are not the same
-        raise NotImplementedError("Cross device mesh comm not supported yet!")
-
-    new_local_tensor = _redistributed_spmd_tensor_inner(
-        input.to_local(),
-        input.size(),
-        device_mesh,
-        input.placements,
-        placements,
-    )
 
     return spmd_tensor.DTensor(
         new_local_tensor,

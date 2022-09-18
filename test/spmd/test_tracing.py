@@ -12,7 +12,7 @@ from torch.fx.experimental.proxy_tensor import (
 from torch.testing._internal.common_utils import run_tests
 from torch.distributed._spmd.comm_tensor import _get_tracer
 
-from torch.utils._pytree import tree_flatten, tree_map
+from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 import spmd
 from spmd.testing.common_utils import (  # type: ignore
@@ -24,13 +24,15 @@ from spmd.tensor import (
     DTensor,
     DeviceMesh,
     Replicate,
+    Placement,
     Shard,
 )
 from spmd.tensor.dispatch import operator_dispatch
 
+from dataclasses import dataclass
 import copy
 from functools import partial
-from typing import List
+from typing import List, Sequence
 
 
 class TraceDeviceMeshTestBase:
@@ -186,8 +188,10 @@ class TraceDeviceMesh2DTest(DistTensorTestBase, TraceDeviceMeshTestBase):
         self._test_all_gather_nd(torch.arange(4).reshape(2, 2))
 
 
-def _local_dispatch(op, local_args, local_kwargs)
-
+@dataclass
+class DTensorConfigs:
+    device_mesh: DeviceMesh
+    placements: Sequence[Placement]
 
 class TraceDistTensorTest(DistTensorTestBase):
     @property
@@ -248,20 +252,65 @@ class TraceDistTensorTest(DistTensorTestBase):
                 )
                 node_to_obj[node] = out
 
+                def unwrap_local_args(e):
+                    if isinstance(e, DTensor):
+                        return e._local_tensor
+                    else:
+                        return e
+
+                def unwrap_dt_configs(e):
+                    if isinstance(e, DTensor):
+                        return DTensorConfigs(
+                            device_mesh=e.device_mesh,
+                            placements=e.placements,
+                        )
+                    else:
+                        return e
+
+                local_args = tree_map(unwrap_local_args, args)
+                dt_configs = tree_map(unwrap_dt_configs, args)
+
+                def dispatch_with_local_tensors(
+                    local_args,
+                    kwargs=None,
+                    op_call=None,
+                    dt_configs=None,
+                ):
+                    flatten_local_args, spec = tree_flatten(local_args)
+                    flatten_dt_configs, spec = tree_flatten(dt_configs)
+
+                    flatten_dt_args = []
+                    for local_arg, dt_config in zip(flatten_local_args, flatten_dt_configs):
+                        flatten_dt_args.append(
+                            DTensor.from_local(
+                                local_arg,
+                                device_mesh=dt_config.device_mesh,
+                                placements=dt_config.placements,
+                            )
+                        )
+                    dt_args = tree_unflatten(flatten_dt_args, spec)
+
+                    return operator_dispatch(
+                        op_call,
+                        dt_args,
+                        kwargs,
+                        DTensor._op_to_rules,
+                        DTensor._custom_dispatch_ops,
+                    )
+
                 # avoid tracing node.target, _op_to_rules and
                 # _custom_dispatch_ops as placeholders
                 dispatch = partial(
-                    operator_dispatch,
-                    node.target,
+                    dispatch_with_local_tensors,
                     # HACK
                     kwargs=kwargs,
-                    op_to_rules=DTensor._op_to_rules,
-                    custom_dispatch_ops=DTensor._custom_dispatch_ops,
+                    op_call=node.target,
+                    dt_configs=dt_configs,
                 )
                 #dispatch_f = partial(dispatch, node.target)
                 # trace DTensor's dispatch logic
                 print("==== before dispatch make_fx")
-                replacements[node] = make_fx(dispatch)(args)
+                replacements[node] = make_fx(dispatch)(local_args)
 
                 if self.rank == 0 and "copy_" in node.target.__name__:
                     print("---- copy subgraph is ")

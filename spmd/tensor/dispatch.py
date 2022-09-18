@@ -19,8 +19,6 @@ from spmd.tensor.utils import (
     pack_args_kwargs_with_local_tensor,
 )
 
-from torch.fx.experimental.proxy_tensor import get_torch_dispatch_modes, proxy_call
-
 
 """
 If _ENABLE_FALLBACK set to False, dispatch will fail when an op doesn't
@@ -224,7 +222,7 @@ def operator_dispatch(
             return tuple(out_dts) if len(out_dts) > 1 else out_dts[0]
         else:
             if not any(
-                [_get_tracer(r) for r in tree_flatten(local_results)[0] if isinstance(r, torch.Tensor)]
+                [_get_tracer(r) for r in tree_flatten(local_results)[0]]
             ):
                 # eager mode
                 return wrap(local_results, output_sharding.output_spec)
