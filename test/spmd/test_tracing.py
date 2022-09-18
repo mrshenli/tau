@@ -281,13 +281,16 @@ class TraceDistTensorTest(DistTensorTestBase):
 
                     flatten_dt_args = []
                     for local_arg, dt_config in zip(flatten_local_args, flatten_dt_configs):
-                        flatten_dt_args.append(
-                            DTensor.from_local(
-                                local_arg,
-                                device_mesh=dt_config.device_mesh,
-                                placements=dt_config.placements,
+                        if isinstance(local_arg, torch.Tensor):
+                            flatten_dt_args.append(
+                                DTensor.from_local(
+                                    local_arg,
+                                    device_mesh=dt_config.device_mesh,
+                                    placements=dt_config.placements,
+                                )
                             )
-                        )
+                        else:
+                            flatten_dt_args.append(local_arg)
                     dt_args = tree_unflatten(flatten_dt_args, spec)
 
                     return operator_dispatch(
@@ -309,11 +312,11 @@ class TraceDistTensorTest(DistTensorTestBase):
                 )
                 #dispatch_f = partial(dispatch, node.target)
                 # trace DTensor's dispatch logic
-                print("==== before dispatch make_fx")
+                if self.rank == 0:
+                    print("==== before dispatch make_fx", node.target.__name__)
                 replacements[node] = make_fx(dispatch)(local_args)
 
-                if self.rank == 0 and "copy_" in node.target.__name__:
-                    print("---- copy subgraph is ")
+                if self.rank == 0:
                     replacements[node].graph.print_tabular()
 
             elif node.op == "output":
@@ -362,8 +365,9 @@ class TraceDistTensorTest(DistTensorTestBase):
                         )
 
             if self.rank == 0:
-                print(f"\n=====after replacing {node.target.__name__}\n")
-                traced_f.graph.print_tabular()
+                #print(f"\n=====after replacing {node.target.__name__}\n")
+                #traced_f.graph.print_tabular()
+                pass
 
         traced_f.graph.lint()
         traced_f.graph.eliminate_dead_code()
@@ -377,7 +381,7 @@ class TraceDistTensorTest(DistTensorTestBase):
 
         if self.rank == 0:
             print(z, f(x, y))
-            traced_f.graph.print_tabular()
+            #traced_f.graph.print_tabular()
         #self.assertEqual(z, f(x, y))
 
     @with_comms
@@ -432,9 +436,6 @@ class TraceDistTensorTest(DistTensorTestBase):
         xd = DTensor.from_local(torch.ones(10, 10), mesh, [Shard(0)])
         yd = DTensor.from_local(torch.ones(10, 10, requires_grad=True), mesh, [Replicate()])
         out_spec = [Shard(0)]
-        if self.rank == 1:
-            import time
-            time.sleep(2)
         self._test_expand(xd, yd, f, mesh, out_spec)
 
 
