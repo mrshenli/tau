@@ -26,7 +26,7 @@ from spmd.tensor import (
     Replicate,
     Shard,
 )
-from spmd.tensor.dispatch import operator_dispatch
+from spmd.tensor.dispatch import operator_dispatch, prepare_schema
 
 import copy
 from functools import partial
@@ -186,7 +186,30 @@ class TraceDeviceMesh2DTest(DistTensorTestBase, TraceDeviceMeshTestBase):
         self._test_all_gather_nd(torch.arange(4).reshape(2, 2))
 
 
-def _local_dispatch(op, local_args, local_kwargs)
+def _mini_dispatch(
+    local_args=(),
+    op=None,
+    sizes_map={},
+    current_placements_map={},
+    target_mesh_map={},
+    target_placements_map={},
+    kwargs={},
+):
+    def redistribute(arg):
+        if arg in target_placements_map:
+            return _redistributed_spmd_tensor_inner(
+                arg,
+                sizes_map[arg],
+                target_mesh_map[arg],
+                current_placements_map[arg],
+                target_placements_map[arg],
+            )
+        else:
+            return arg
+
+    redistributed_args = tree_map(redistribute, local_args)
+    return op(*redistributed_args, **kwargs)
+
 
 
 class TraceDistTensorTest(DistTensorTestBase):
@@ -248,6 +271,7 @@ class TraceDistTensorTest(DistTensorTestBase):
                 )
                 node_to_obj[node] = out
 
+                """
                 # avoid tracing node.target, _op_to_rules and
                 # _custom_dispatch_ops as placeholders
                 dispatch = partial(
@@ -262,6 +286,53 @@ class TraceDistTensorTest(DistTensorTestBase):
                 # trace DTensor's dispatch logic
                 print("==== before dispatch make_fx")
                 replacements[node] = make_fx(dispatch)(args)
+                """
+
+
+                ###################
+                sharding_prop_func = DTensor._op_to_rules.get(str(node.target), None)
+                assert sharding_prop_func is not None
+                target_schema, redistribute, output_sharding = prepare_schema(
+                    sharding_prop_func, args, kwargs
+                )
+
+                sizes_map, current_placements_map = {}, {}
+
+                def unwrap_dt_info(e):
+                    nonlocal sizes_map, current_placements_map
+                    if isinstance(e, DTensor):
+                        sizes_map[e._local_tensor] = e.size()
+                        current_placements_map[e._local_tensor] = e.placements
+
+                flatten_args, args_tree_spec = tree_flatten(args)
+                flatten_args_schema, _ = tree_flatten(target_schema.args_schema)
+
+                target_mesh_map, target_placements_map = {}, {}
+                for i, arg in enumerate(flatten_args):
+                    if isinstance(arg, DTensor):
+                        if redistribute:
+                            target_spec = flatten_args_schema[i]
+                            target_mesh_map[arg._local_tensor] = target_spec.mesh
+                            target_placements_map = target_spec.placements
+
+                dispatch = partial(
+                    _mini_dispatch,
+                    op=node.target,
+                    sizes_map=sizes_map,
+                    current_placements_map=current_placements_map,
+                    target_mesh_map=target_mesh_map,
+                    target_placements_map=target_placements_map,
+                    kwargs=kwargs,
+                )
+
+                def unwrap_local(e):
+                    if isinstance(e, DTensor):
+                        return e._local_tensor
+                    else:
+                        return e
+
+                replacements[node] = make_fx(dispatch)(tree_map(unwrap_local, args))
+                ###################
 
                 if self.rank == 0 and "copy_" in node.target.__name__:
                     print("---- copy subgraph is ")
@@ -322,12 +393,18 @@ class TraceDistTensorTest(DistTensorTestBase):
         zd = DTensor(
             traced_f(xd._local_tensor, yd._local_tensor), mesh, out_spec
         )
+        """
         z = zd.redistribute(
             device_mesh=mesh, placements=[Replicate()]
         ).to_local()
+        """
+
+        x.grad = None
+        y.grad = None
 
         if self.rank == 0:
-            print(z, f(x, y))
+            #print(xd._local_tensor, x, y.grad)
+            print(zd._local_tensor, f(x, y))
             traced_f.graph.print_tabular()
         #self.assertEqual(z, f(x, y))
 
@@ -369,23 +446,6 @@ class TraceDistTensorTest(DistTensorTestBase):
         yd = DTensor.from_local(torch.ones(10, 10, requires_grad=True), mesh, [Replicate()])
         # y += y.grad makes y a partial, as y.grad is partial
         out_spec = [_Partial()]
-        self._test_expand(xd, yd, f, mesh, out_spec)
-
-    @with_comms
-    def test_simple_expand_replicate_shard_tensor(self):
-        def f(x, y):
-            z = x.matmul(y)
-            z.sum().backward()
-            return y + y.grad
-
-        mesh = DeviceMesh(self.device_type, torch.arange(2))
-
-        xd = DTensor.from_local(torch.ones(10, 10), mesh, [Shard(0)])
-        yd = DTensor.from_local(torch.ones(10, 10, requires_grad=True), mesh, [Replicate()])
-        out_spec = [Shard(0)]
-        if self.rank == 1:
-            import time
-            time.sleep(2)
         self._test_expand(xd, yd, f, mesh, out_spec)
 
 

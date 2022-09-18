@@ -68,7 +68,7 @@ def _decompose_reshard(val: List[_PlacementItem]) -> List[_PlacementItem]:
 
 
 def _redistributed_spmd_tensor_inner(
-    local_input: torch.Tensor,
+    local_tensor: torch.Tensor,
     sizes: torch.Size,
     device_mesh: DeviceMesh,
     current_placements: List[Placement],
@@ -76,7 +76,7 @@ def _redistributed_spmd_tensor_inner(
 ) -> torch.Tensor:
     new_local_tensor = None
 
-    sorted_placements = list(enumerate(zip(current_placements, placements)))
+    sorted_placements = list(enumerate(zip(current_placements, target_placements)))
     sorted_placements = _decompose_reshard(sorted_placements)
     sorted_placements.sort(key=_replicate_then_shard)
 
@@ -154,7 +154,7 @@ def _redistributed_spmd_tensor_inner(
                     new_local_tensor = local_tensor
             else:
                 raise RuntimeError(
-                    f"redistribute from {current_placements} to {placements} not supported yet"
+                    f"redistribute from {current_placements} to {target_placements} not supported yet"
                 )
 
         assert new_local_tensor is not None
