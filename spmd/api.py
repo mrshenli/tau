@@ -9,10 +9,12 @@ from torch.testing._internal.common_utils import run_tests
 from torch.distributed._spmd.comm_tensor import _get_tracer
 from torch.utils._pytree import tree_flatten, tree_map
 from functorch.compile import aot_module
+from functorch._src.named_members_polyfill import _named_buffers, _named_parameters
 
 from dataclasses import dataclass
 
 from spmd.tensor import (
+    _Partial,
     DTensor,
     DeviceMesh,
     Placement,
@@ -52,13 +54,85 @@ def _dispatch_with_local_tensors(
     return op(*tree_map(redistribute, local_args), **kwargs)
 
 
+def _get_dtensor_dispatch_graph(
+    node: fx.Node, node_to_obj: Dict[fx.Node, object],
+) -> fx.GraphModule:
+
+    def remap_arg(arg):
+        if isinstance(arg, torch.fx.Node):
+            obj = node_to_obj[arg]
+            if _get_tracer(obj):
+                # This is a shared arg, already has a tracer from previous
+                # tracing. Delete the tracer.
+                del obj.__dict__[proxy_slot]
+            return obj
+        else:
+            return arg
+
+    print("=== tracing ", node.name, node.target, node.args, node.kwargs)
+    args = tree_map(remap_arg, node.args)
+    # kwargs in this set of tests are all constants
+    kwargs = node.kwargs
+
+    # run dispatch once to get the real DTensor output
+    out = operator_dispatch(
+        node.target,
+        args,
+        node.kwargs,  # kwargs in this set of tests are all constants
+        DTensor._op_to_rules,
+        DTensor._custom_dispatch_ops,
+    )
+    node_to_obj[node] = out
+    print("=== dtensor out, ", out.placements, out.size())
+
+    # get DTensor specs for inputs and outputs
+    (
+        target_schema,
+        redistribute,
+        output_sharding,
+    ) = propagate_input_sharding(
+        node.target,
+        args,
+        kwargs,
+        DTensor._op_to_rules,
+    )
+
+    flatten_args, args_tree_spec = tree_flatten(args)
+    flatten_args_schema, _ = tree_flatten(target_schema.args_schema)
+
+    specs: Dict[
+        torch.Tensor,
+        Tuple[
+            torch.Size,
+            DeviceMesh,
+            Sequence[Placement],
+            Sequence[Placement],
+        ],
+    ] = {}
+    for i, arg in enumerate(flatten_args):
+        if isinstance(arg, DTensor) and redistribute:
+            specs[arg._local_tensor] = (
+                arg.size(),
+                flatten_args_schema[i].mesh,
+                arg.placements,
+                flatten_args_schema[i].placements,
+            )
+
+    dispatch = partial(
+        _dispatch_with_local_tensors,
+        node.target,
+        kwargs=kwargs,
+        specs=specs,
+    )
+
+    def unwrap_local(e):
+        return e._local_tensor if isinstance(e, DTensor) else e
+
+    return make_fx(dispatch)(tree_map(unwrap_local, args))
+
+
 class SPMD(nn.Module):
-    def __init__(
-        self,
-        module: nn.Module,
-        schema: Schema,
-        schema_override: Callable[[str, nn.Module], nn.Module],
-    ):
+    def __init__(self, module: nn.Module, schema: Schema):
         super().__init__()
         assert schema.placements == [Replicate()], (
             "SPMD only support Replicate() parameters for now"
@@ -66,115 +140,71 @@ class SPMD(nn.Module):
         self._local_module = module
         self._schema = schema
 
-        # TODO: support schema_override
+        # TODO: add schema_override
 
         self._compiled_m = None
 
-    def _compile_fwd(self, gm: fx.GraphModule, inps: List[torch.Tensor]) -> fx.GraphModule:
+    def _compile(self, gm: fx.GraphModule, inps: List[torch.Tensor]) -> fx.GraphModule:
+        def is_param(t: torch.Tensor) -> bool:
+            # N.B.: id(t) and id(param) does not match
+            return t.storage().data_ptr() in [p.storage().data_ptr() for p in self._local_module.parameters()]
+
         # HACK: use pytree order of params to map to primals, and save the info
         # for compile_bwd.
+        """
         def to_param(model: nn.Module, primal_name: str) -> torch.nn.Parameter:
             idx = int(primal_name.split("_")[-1]) - 1
             params = [p for _, p in list(tree_flatten(model.named_parameters())[0][0])]
             return params[idx] if idx < len(params) else None
-
-        def to_dtensor(schema: Schema, t: torch.Tensor) -> DTensor:
-                return DTensor.from_local(t, schema.mesh, schema.placements)
+        """
 
         node_to_obj: Dict[fx.Node, object] = {}
         # map local op node in traced_f to its corresponding subgraph of
         # DTensor ops.
         replacements: Dict[torch.fx.Node, torch.fx.GraphModule] = {}
 
-        def remap_arg(arg):
-            if isinstance(arg, torch.fx.Node):
-                obj = node_to_obj[arg]
-                if _get_tracer(obj):
-                    # This is a shared arg, already has a tracer from previous
-                    # tracing. Delete the tracer.
-                    del obj.__dict__[proxy_slot]
-                return obj
-            else:
-                return arg
-
-        inp_idx = 0
-        for node in gm.graph.nodes:
+        for i, node in enumerate(gm.graph.nodes):
             if node.op == "placeholder":
-                p = to_param(self._local_module, node.name)
-                if p is not None:
+                assert i < len(inps)
+                #p = to_param(self._local_module, node.name)
+                if is_param(inps[i]):
                     node_to_obj[node] = DTensor.from_local(
-                        p, self._schema.mesh, self._schema.placements
+                        inps[i], self._schema.mesh, self._schema.placements
                     )
                 else:
                     node_to_obj[node] = DTensor.from_local(
-                        inps[inp_idx], self._schema.mesh, [Shard(0)]
+                        inps[i], self._schema.mesh, [Shard(0)]
                     )
-                    inp_idx += 1
             elif isinstance(node.target, torch._ops.OpOverload):
-                args = tree_map(remap_arg, node.args)
-                # kwargs in this set of tests are all constants
-                kwargs = node.kwargs
-
-                # run dispatch once to get the real DTensor output
-                out = operator_dispatch(
-                    node.target,
-                    args,
-                    node.kwargs,  # kwargs in this set of tests are all constants
-                    DTensor._op_to_rules,
-                    DTensor._custom_dispatch_ops,
-                )
-                node_to_obj[node] = out
-
-                # get DTensor specs for inputs and outputs
-                (
-                    target_schema,
-                    redistribute,
-                    output_sharding,
-                ) = propagate_input_sharding(
-                    node.target,
-                    args,
-                    kwargs,
-                    DTensor._op_to_rules,
-                )
-
-                flatten_args, args_tree_spec = tree_flatten(args)
-                flatten_args_schema, _ = tree_flatten(target_schema.args_schema)
-
-                specs: Dict[
-                    torch.Tensor,
-                    Tuple[
-                        torch.Size,
-                        DeviceMesh,
-                        Sequence[Placement],
-                        Sequence[Placement],
-                    ],
-                ] = {}
-                for i, arg in enumerate(flatten_args):
-                    if isinstance(arg, DTensor) and redistribute:
-                        specs[arg._local_tensor] = (
-                            arg.size(),
-                            flatten_args_schema[i].mesh,
-                            arg.placements,
-                            flatten_args_schema[i].placements,
-                        )
-
-                dispatch = partial(
-                    _dispatch_with_local_tensors,
-                    node.target,
-                    kwargs=kwargs,
-                    specs=specs,
-                )
-
-                def unwrap_local(e):
-                    return e._local_tensor if isinstance(e, DTensor) else e
-
-                replacements[node] = make_fx(dispatch)(
-                    tree_map(unwrap_local, args)
+                replacements[node] = _get_dtensor_dispatch_graph(
+                    node, node_to_obj
                 )
             elif node.op == "output":
-                # do nothing, its args will be replaced by dispatcher's
-                # output in the next for loop
-                pass
+                """
+                for a in node.args[0]:
+                    if a is None:
+                        continue
+                    obj = node_to_obj[a]
+                    if isinstance(obj, DTensor) and isinstance(obj.placements[0], _Partial):
+                        def dummy_add(grad, zero) -> torch.Tensor:
+                            return grad + zero
+
+                        grad = obj._local_tensor
+                        zero = torch.zeros_like(obj._local_tensor)
+
+                        traced_add = make_fx(dummy_add)(grad, zero)
+
+                        redistribute_g = make_fx(
+                            partial(
+                                redistribute,
+                                obj.size(),  # full tensor size
+                                obj.device_mesh,
+                                obj.placements,  # current placements
+                                [Replicate()],  # target placements
+                            )
+                        )(obj._local_tensor)
+                        redistribute_g.graph.print_tabular()
+                """
             else:
                 raise ValueError(f"Unrecognized node {node}")
 
@@ -212,20 +242,23 @@ class SPMD(nn.Module):
                             dtn, lambda n: value_remap[n]
                         )
 
+
         gm.graph.lint()
+        gm.graph.eliminate_dead_code()
         gm.graph.print_tabular()
         # TODO: update placeholder names in backward graph
-        gm.graph.eliminate_dead_code()
+
 
         return gm
 
-    def _compile_bwd(self, gm: fx.GraphModule, inps: List[torch.Tensor]) -> fx.GraphModule:
-        #gm.graph.print_tabular()
-        return gm
 
     def forward(self, *args, **kwargs):
         if self._compiled_m is None:
-            self._compiled_m = aot_module(self._local_module, self._compile_fwd, self._compile_bwd)
+            self._compiled_m = aot_module(
+                self._local_module,
+                self._compile,
+                self._compile,
+            )
 
         return self._compiled_m(*args, **kwargs)
 
@@ -239,7 +272,7 @@ def run(rank, world_size):
         mesh=DeviceMesh(device.type, torch.arange(2)),
         placements=[Replicate()],
     )
-    spmd = SPMD(m, schema=schema, schema_override=lambda x: x)
+    spmd = SPMD(m, schema=schema)
     spmd(torch.zeros(2, 10)).sum().backward()
 
 
