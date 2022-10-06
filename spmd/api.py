@@ -180,9 +180,10 @@ class SPMD(nn.Module):
                     node, node_to_obj
                 )
             elif node.op == "output":
-                """
+                new_args = []
                 for a in node.args[0]:
-                    if a is None:
+                    if not isinstance(a, fx.Node):
+                        new_args.append(a)
                         continue
                     obj = node_to_obj[a]
                     if isinstance(obj, DTensor) and isinstance(obj.placements[0], _Partial):
@@ -194,20 +195,52 @@ class SPMD(nn.Module):
 
                         traced_add = make_fx(dummy_add)(grad, zero)
 
-                        redistribute_g = make_fx(
-                            partial(
-                                redistribute,
-                                obj.size(),  # full tensor size
-                                obj.device_mesh,
-                                obj.placements,  # current placements
-                                [Replicate()],  # target placements
-                            )
-                        )(obj._local_tensor)
-                        redistribute_g.graph.print_tabular()
-                """
+                        placeholders = [n for n in traced_add.graph.nodes if n.op == "placeholder"]
+                        call_functions = [n for n in traced_add.graph.nodes if n.op == "call_function"]
+                        assert len(placeholders) == 2
+                        assert len(call_functions) == 1
+                        node_to_obj[placeholders[0]] = obj
+                        node_to_obj[placeholders[1]] = zero
+                        traced_dispatch = _get_dtensor_dispatch_graph(call_functions[0], node_to_obj)
+                        traced_dispatch.graph.lint()
+
+                        wait = [n for n in traced_dispatch.graph.nodes if n.name == "wait_comm"]
+                        add = [n for n in traced_dispatch.graph.nodes if n.name == "add"]
+                        assert len(wait) == 1 and len(add) == 1
+                        add[0].replace_all_uses_with(wait[0])
+                        traced_dispatch.graph.lint()
+                        traced_dispatch.graph.eliminate_dead_code()
+
+                        #traced_dispatch.graph.print_tabular()
+
+
+                        value_remap: Dict[fx.Node, fx.Node] = {}
+                        for dtn in traced_dispatch.graph.nodes:
+                            if dtn.op == "placeholder":
+                                # do nothing, ignore placeholders, as it has already
+                                # been prepared in value_remap
+                                value_remap[dtn] = a
+                            elif dtn.op == "output":
+                                assert (
+                                    len(dtn.args) == 1 and len(dtn.args[0]) == 1
+                                ), f"Expecting single output, but got {dtn.args}"
+                                #a.replace_all_uses_with(value_remap[dtn.args[0][0]])
+                                new_args.append(value_remap[dtn.args[0][0]])
+                            else:
+                                if dtn.op == "get_attr":
+                                    setattr(gm, dtn.target, getattr(traced_dispatch, dtn.target))
+                                with gm.graph.inserting_before(node):
+                                    value_remap[dtn] = gm.graph.node_copy(
+                                        dtn, lambda n: value_remap[n]
+                                    )
+
+                gm.graph.erase_node(node)
+                gm.graph.output(new_args)
+                break
             else:
                 raise ValueError(f"Unrecognized node {node}")
 
+        gm.graph.print_tabular()
 
         # replace nodes in local traced graph with DTensor's dispatch graph
         for node in gm.graph.nodes:
@@ -273,7 +306,10 @@ def run(rank, world_size):
         placements=[Replicate()],
     )
     spmd = SPMD(m, schema=schema)
-    spmd(torch.zeros(2, 10)).sum().backward()
+    spmd(torch.ones(2, 10) * rank).sum().backward()
+
+
+    print([p.grad for p in m.parameters()])
 
 
 if __name__=="__main__":
